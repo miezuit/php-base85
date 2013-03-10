@@ -42,8 +42,8 @@
   
   Functions
   ---------
-  string base85_encode(string $data) - encodes a string using base85
-  string base85_decode(string $data) - decodes a string encoded with base85
+  string base85_encode(string $data) - encodes a string using RFC1924 base85
+  string base85_decode(string $data) - decodes a string encoded with RFC1924 base85
  */
 
 #ifdef HAVE_CONFIG_H
@@ -79,33 +79,37 @@ zend_module_entry base85_module_entry = {
 ZEND_GET_MODULE(base85)
 #endif
 
+static const char ZERO_BYTE = 0;
+static const char DECODING_ERROR = -1;
+
 /************************
 * function declarations *
 ************************/
-void encode_85(char *buf, const unsigned char *data, int bytes);
+int encode_85(char *buf, const unsigned char *data, int bytes);
 int decode_85(char *dst, const char *buffer, int len);
+void _copy_with_padding(char *dest, const char *src, int len, int padding_size, char padding_char);
 
 /* {{{ proto string base85_encode(string data)
  */
 PHP_FUNCTION(base85_encode)
 {
-    char *data, *buf;
-    int data_len;
+    char *data, *encoded;
+    int data_len, encoded_len;
 
     if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &data, &data_len) == FAILURE) {
         RETURN_NULL();
     }
     
     /* base85 encodes 4 bytes into 5 bytes;
-       therefore the required buffer size is: ceil(data_len * 5/4) + 1 (for the last null byte) 
+       therefore the required buffer size is: ceil(data_len * 5/4) + 1 (for the last null byte)
     */
-    buf = emalloc(((int) (data_len * 1.25) + 2) * sizeof(char));
+    encoded = emalloc(( (int) (data_len / 4) * 5 + 6) * sizeof(char));
     
-    encode_85(buf, data, data_len);
+    encoded_len = encode_85(encoded, data, data_len);
     
-    RETURN_STRING(buf, 1);
+    RETURN_STRINGL(encoded, encoded_len, 1);
     
-    efree(buf);
+    efree(encoded);
 }
 /* }}} */
 
@@ -113,26 +117,28 @@ PHP_FUNCTION(base85_encode)
  */
 PHP_FUNCTION(base85_decode)
 {
-    char *data, *buf;
-    int data_len;
+    char *data, *decoded;
+    int data_len, decoded_len;
 
     if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &data, &data_len) == FAILURE) {
         RETURN_NULL();
     }    
     
-    buf = emalloc((data_len + 1) * sizeof(char));
+    decoded = emalloc(data_len * sizeof(char));
     
-    if(0 == decode_85(buf, data, data_len)) {
-        RETURN_STRING(buf, 1);
+    decoded_len = decode_85(decoded, data, data_len);
+    
+    if(decoded_len != DECODING_ERROR) {
+        RETVAL_STRINGL(decoded, decoded_len, 1);
     } else {
         RETURN_NULL();
     }
 
-    efree(buf);    
+    efree(decoded);
 }
 /* }}} */
 
-static const char en85[] = {
+static const char base85_alphabet[] = {
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
     'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
@@ -145,77 +151,132 @@ static const char en85[] = {
     '|', '}', '~'
 };
 
-void encode_85(char *buffer, const unsigned char *data, int len)
+int encode_85(char* encoded, const unsigned char *data, int len)
 {
-    while (len) {
+    /* Base85 encodes 4-byte chunks at a time.
+       Which means the lenght of the byte sequence must be divisible by 4.
+       If the last block of source bytes contains fewer than 4 bytes,
+       the block is padded with up to three null bytes before encoding.
+     */
+    unsigned char *buffer;
+    int buffer_len, padding_size = 0;
+    
+    int remainder = len % 4;
+    if (remainder) {
+        padding_size = 4 - remainder;
+    }
+    
+    buffer_len = len + padding_size;
+    buffer = emalloc(buffer_len * sizeof(char));
+
+    // copy input data into buffer
+    _copy_with_padding(buffer, data, len, padding_size, ZERO_BYTE);
+    
+    int i;
+    /* encode 4-byte chunks */
+    for (i = 0; i < buffer_len; i += 4) {
         unsigned acc = 0;
         int cnt;
-        /* Pack a 4-character block */
-        for (cnt = 24; cnt >= 0; cnt -= 8) {
-            unsigned ch = *data++;
-            acc |= ch << cnt;
-            if (--len == 0)
-                break;
+        
+        /* string to int */
+        for (cnt = 0; cnt < 4; cnt++) {
+            unsigned ch = buffer[i + cnt];
+            acc |= ch << ((3 - cnt) * 8);
         }
+        /* int to base85 */
         for (cnt = 4; cnt >= 0; cnt--) {
             int val = acc % 85;
             acc /= 85;
-            buffer[cnt] = en85[val];
+            encoded[cnt] = base85_alphabet[val];
         }
-        buffer += 5;
+        encoded += 5;
     }
 
-    *buffer = 0;
+    // as much padding added before encoding is removed after encoding
+    encoded[-padding_size] = ZERO_BYTE;
+    
+    // cleanup
+    efree(buffer);
+    
+    return (buffer_len / 4) * 5 - padding_size;
 }
 
-int decode_85(char *buffer, const char *data, int len)
+int decode_85(char *decoded, const char *data, int len)
 {
     /* prapare base85 decoding */
-    char de85[256];
-    int offset = 0;
+    char base85_ords[256];
+    int buffer_len, padding_size = 0;
+    char *buffer;
     
     int i;
     for (i = 0; i < 85; i++) {
-        int ch = en85[i];
-        de85[ch] = i + 1;
+        int ch = base85_alphabet[i];
+        base85_ords[ch] = i + 1;
+    }    
+    
+   /* We want 5-tuple chunks, so pad with as many 84 characters
+    * to satisfy the length.
+    */    
+    int remainder = len % 5;
+    if (remainder) {
+        padding_size = 5 - remainder;
     }
+    
+    buffer_len = len + padding_size;
+    buffer = emalloc(buffer_len * sizeof(char));
 
-    /* start decoding */
-    while (len > 0) {
+    // copy input data into buffer
+    _copy_with_padding(buffer, data, len, padding_size, base85_alphabet[84]); // 84 = "u"(ASCII85); "~"(RFC1924)
+
+    /* decode 5-byte chunks */
+    for (i = 0; i < buffer_len; i += 5) {
         unsigned acc = 0;
         int de, cnt;
         unsigned char ch;
-        /* Unpack a 5-character block */
-        for (cnt = 4; cnt >= 0; cnt--) {
-            ch = *data++;
-            offset++;
-            de = de85[ch];
+        
+        /* base85 to int */
+        for (cnt = 0; cnt < 5; cnt++) {
+            ch = buffer[i + cnt];
+            de = base85_ords[ch];
             if (--de < 0) {
-                php_error_docref(NULL TSRMLS_CC, E_WARNING, "invalid base85 alphabet %c at offset %d", ch, offset);
-                return 1;
+                php_error_docref(NULL TSRMLS_CC, E_WARNING, "invalid base85 alphabet %c at offset %d", ch, i + cnt);
+                return DECODING_ERROR;
             }
-            if (cnt) {
-                /* except for the last char */
-                acc = acc * 85 + de;
-            }
+            acc = acc * 85 + de;
         }
-        /* Detect overflow. */
-        if (0xffffffff / 85 < acc ||
-            0xffffffff - de < (acc *= 85)) {
-            php_error_docref(NULL TSRMLS_CC, E_WARNING, "invalid base85 sequence %.5s", data - 5);
-            return 1;
+        /* Detect overflow. Groups of characters that decode to a value greater than 2**32 − 1
+         * will cause a decoding error.
+         */
+        if (acc >= 0xffffffff) {
+            php_error_docref(NULL TSRMLS_CC, E_WARNING, "invalid base85 sequence %.5s", buffer - 5);
+            return DECODING_ERROR;
         }
-        acc += de;
-
-        cnt = (len < 5) ? len : 4;
-        len -= 5;
-        do {
+        /* int to string */
+        for (cnt = 0; cnt < 4; cnt++) {
+            /* shift forward the cnt-th char */
             acc = (acc << 8) | (acc >> 24);
-            *buffer++ = acc;
-        } while (--cnt);
+            *decoded++ = acc;
+        }
     }
 
-    *buffer = 0;
+    // as much padding added before encoding is removed after encoding
+    decoded[-padding_size] = 0;
+
+    // cleanup
+    efree(buffer);
     
-    return 0;
+    return (buffer_len / 5) * 4 - padding_size;
+}
+
+void _copy_with_padding(char *dest, const char *src, int len, int padding_size, char padding_char)
+{
+    // copy input data into buffer
+    int i;
+    for (i = 0; i < len; i++) {
+        dest[i] = src[i];
+    }
+    // add padding
+    for (i = len; i < len + padding_size; i++) {
+        dest[i] = padding_char;
+    }
 }
