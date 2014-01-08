@@ -78,3 +78,9 @@ Installation
    ```
 5. Add the line `extension=base85.so` to your php.ini to trigger it to load on startup.
 
+Alternatives
+------------
+
+There is also a pure PHP library [php-base85](https://github.com/scottchiefbaker/php-base85).
+That library is easier to install as it does not require the ability to load extensions.
+
